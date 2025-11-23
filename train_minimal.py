@@ -17,6 +17,9 @@ import argparse
 def training(args):
     """Minimal training function."""
 
+    # Get resolution (default to -1 if not specified)
+    resolution = getattr(args, 'resolution', -1)
+
     # Output directory
     output_dir = f"output/minimal_3dgs_{os.path.basename(args.source_path)}_{args.iterations}iter"
     os.makedirs(output_dir, exist_ok=True)
@@ -26,6 +29,7 @@ def training(args):
     print(f"   📁 Dataset: {args.source_path}")
     print(f"   💾 Output: {output_dir}")
     print(f"   🔄 Iterations: {args.iterations}")
+    print(f"   📐 Resolution: {resolution} (-1=auto, 1/2/4/8=divide, >8=target width)")
 
     # Parse arguments using standard classes
     parser = argparse.ArgumentParser()
@@ -39,7 +43,7 @@ def training(args):
         model_path=output_dir,
         images="renders",
         depths="",
-        resolution=-1,
+        resolution=resolution,
         white_background=False,
         data_device="cuda",
         eval=True,
@@ -198,6 +202,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Minimal 3DGS Training")
     parser.add_argument("-s", "--source_path", required=True)
     parser.add_argument("--iterations", type=int, default=2000)
+    parser.add_argument("-r", "--resolution", type=int, default=-1,
+                        help="Resolution: -1=auto (max 1600), 1/2/4/8=divide factor, or target width")
     args = parser.parse_args()
 
     training(args)

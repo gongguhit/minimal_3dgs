@@ -99,18 +99,6 @@ class OptimizationParams(ParamGroup):
         self.optimizer_type = "default"
         super().__init__(parser, "Optimization Parameters")
 
-class EventParams(ParamGroup):
-    def __init__(self, parser):
-        self.use_events = False
-        self.event_feature_dim = 0
-        super().__init__(parser, "Event Parameters")
-
-class LanguageParams(ParamGroup):
-    def __init__(self, parser):
-        self.use_language = False
-        self.language_feature_dim = 0
-        super().__init__(parser, "Language Parameters")
-
 def get_combined_args(parser : ArgumentParser):
     cmdlne_string = sys.argv[1:]
     cfgfile_string = "Namespace()"
