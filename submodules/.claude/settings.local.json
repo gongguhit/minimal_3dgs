@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(nvcc:*)",
+      "Bash(echo:*)",
+      "Bash(ls:*)",
+      "Bash(find:*)",
+      "Read(//usr/local/**)",
+      "Read(//root/eventdeblur3dgs/**)",
+      "Bash(source setup_environment.sh)",
+      "Read(//root/miniconda3/envs/ggev3dgs/**)",
+      "Bash(ln:*)",
+      "Bash(export LIBRARY_PATH:*)",
+      "Bash(export LD_RUN_PATH=/root/miniconda3/envs/ggev3dgs/lib:*)",
+      "Bash(export LDFLAGS=\"-L/root/miniconda3/envs/ggev3dgs/lib\")",
+      "Bash(python:*)",
+      "Read(//tmp/**)",
+      "Bash(unset:*)",
+      "Bash(git clone:*)",
+      "Bash(nvidia-smi:*)",
+      "Bash(pip uninstall:*)",
+      "Bash(./run_pure_3dgs_training.sh:*)",
+      "Bash(source:*)",
+      "Bash(chmod:*)",
+      "Bash(./run_test_distknn.sh:*)",
+      "Bash(tee:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+
+# Data and outputs
+data/
+output/
+*.ply
+*.bin
+*.db
+
+# Logs
+*.log
+nohup*.out
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Submodules build artifacts
+submodules/*/build/
+submodules/*/*.egg-info/
