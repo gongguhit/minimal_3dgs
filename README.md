@@ -241,6 +241,32 @@ python metrics_eval.py -m ./output/minimal_3dgs_my_scene_5000iter --iteration 50
 | **SSIM** | **0.7427** |
 | **LPIPS** | **0.2753** |
 
+### MB Drone Dataset (128 images, DJI Air 3S)
+
+| Stage | Result |
+|-------|--------|
+| Input | 128 DJI Air 3S images (4096×3072) |
+| Preprocessing | Resized to 1600×1200 |
+| COLMAP | 127/128 registered, 80,407 points |
+
+**5000 iterations:**
+| Metric | Value |
+|--------|-------|
+| Gaussians | 783,427 |
+| **PSNR** | **27.24 dB** |
+| **SSIM** | **0.8646** |
+| **LPIPS** | **0.1958** |
+
+**20000 iterations:**
+| Metric | Value |
+|--------|-------|
+| Gaussians | 2,188,330 |
+| **PSNR** | **28.30 dB** |
+| **SSIM** | **0.8982** |
+| **LPIPS** | **0.1333** |
+
+*Note: Real-world drone captures show good results. Training longer (20k vs 5k iterations) improves quality by ~1 dB PSNR.*
+
 *Note: Real-world video captures typically have lower metrics than synthetic datasets due to motion blur and lighting variations.*
 
 ## Project Structure
