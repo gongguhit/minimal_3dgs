@@ -8,6 +8,9 @@ Usage:
 
     # From video
     python colmap_preprocess.py --input ./data/video.mp4 --output ./data/scene --fps 2
+
+    # With GPU acceleration
+    python colmap_preprocess.py --input ./data/raw --output ./data/scene --gpu_index 0
 """
 
 import os
@@ -15,14 +18,199 @@ import sys
 import shutil
 import argparse
 import tempfile
+import signal
+import threading
+import time
+import atexit
+import subprocess
 from pathlib import Path
 from glob import glob
 
 import cv2
 import numpy as np
-import pycolmap
 from PIL import Image
 from plyfile import PlyData, PlyElement
+
+# Memory monitoring
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+    print("Warning: psutil not installed. Memory monitoring disabled.")
+    print("Install with: pip install psutil")
+
+
+# Global flag for graceful shutdown
+_shutdown_requested = False
+_memory_monitor_thread = None
+
+
+def _get_memory_info():
+    """Get current memory usage info."""
+    if not HAS_PSUTIL:
+        return None
+
+    mem = psutil.virtual_memory()
+    return {
+        'total_gb': mem.total / (1024**3),
+        'available_gb': mem.available / (1024**3),
+        'used_gb': mem.used / (1024**3),
+        'percent_used': mem.percent,
+        'percent_available': 100 - mem.percent,
+    }
+
+
+def _get_gpu_memory_info():
+    """Get GPU memory info using nvidia-smi."""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=memory.total,memory.used,memory.free',
+             '--format=csv,noheader,nounits'],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            lines = result.stdout.strip().split('\n')
+            gpu_info = []
+            for i, line in enumerate(lines):
+                parts = [int(x.strip()) for x in line.split(',')]
+                gpu_info.append({
+                    'gpu_index': i,
+                    'total_mb': parts[0],
+                    'used_mb': parts[1],
+                    'free_mb': parts[2],
+                    'percent_used': (parts[1] / parts[0]) * 100 if parts[0] > 0 else 0,
+                })
+            return gpu_info
+    except Exception:
+        pass
+    return None
+
+
+def _check_memory_thresholds(ram_threshold_percent=90, gpu_threshold_percent=95, gpu_index=0):
+    """
+    Check if memory usage exceeds thresholds.
+
+    Returns:
+        tuple: (is_critical, message) - is_critical is True if we should abort
+    """
+    messages = []
+    is_critical = False
+
+    # Check RAM
+    mem_info = _get_memory_info()
+    if mem_info:
+        if mem_info['percent_used'] >= ram_threshold_percent:
+            is_critical = True
+            messages.append(
+                f"CRITICAL: RAM usage at {mem_info['percent_used']:.1f}% "
+                f"({mem_info['used_gb']:.1f}/{mem_info['total_gb']:.1f} GB)"
+            )
+        elif mem_info['percent_used'] >= ram_threshold_percent - 10:
+            messages.append(
+                f"WARNING: RAM usage high at {mem_info['percent_used']:.1f}% "
+                f"({mem_info['available_gb']:.1f} GB available)"
+            )
+
+    # Check GPU memory
+    gpu_info = _get_gpu_memory_info()
+    if gpu_info and gpu_index < len(gpu_info):
+        gpu = gpu_info[gpu_index]
+        if gpu['percent_used'] >= gpu_threshold_percent:
+            is_critical = True
+            messages.append(
+                f"CRITICAL: GPU {gpu_index} memory at {gpu['percent_used']:.1f}% "
+                f"({gpu['used_mb']}/{gpu['total_mb']} MB)"
+            )
+        elif gpu['percent_used'] >= gpu_threshold_percent - 10:
+            messages.append(
+                f"WARNING: GPU {gpu_index} memory high at {gpu['percent_used']:.1f}% "
+                f"({gpu['free_mb']} MB free)"
+            )
+
+    return is_critical, '\n'.join(messages) if messages else None
+
+
+class MemoryMonitor:
+    """Background thread that monitors memory and triggers graceful shutdown if critical."""
+
+    def __init__(self, ram_threshold=90, gpu_threshold=95, gpu_index=0, check_interval=2.0):
+        self.ram_threshold = ram_threshold
+        self.gpu_threshold = gpu_threshold
+        self.gpu_index = gpu_index
+        self.check_interval = check_interval
+        self._stop_event = threading.Event()
+        self._thread = None
+
+    def start(self):
+        """Start the memory monitoring thread."""
+        if not HAS_PSUTIL:
+            print("Memory monitoring disabled (psutil not available)")
+            return
+
+        self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._thread.start()
+        print(f"Memory monitor started (RAM threshold: {self.ram_threshold}%, "
+              f"GPU threshold: {self.gpu_threshold}%)")
+
+    def stop(self):
+        """Stop the memory monitoring thread."""
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=1.0)
+
+    def _monitor_loop(self):
+        """Main monitoring loop."""
+        global _shutdown_requested
+
+        while not self._stop_event.is_set():
+            is_critical, message = _check_memory_thresholds(
+                self.ram_threshold, self.gpu_threshold, self.gpu_index
+            )
+
+            if message and 'WARNING' in message:
+                print(f"\n{message}")
+
+            if is_critical:
+                print(f"\n{'='*60}")
+                print("MEMORY SAFEGUARD TRIGGERED")
+                print('='*60)
+                print(message)
+                print("\nAborting to prevent system crash...")
+                print("Try reducing image count/size or increasing available memory.")
+                print('='*60)
+                _shutdown_requested = True
+                # Give main thread a chance to cleanup
+                time.sleep(0.5)
+                # Force exit if still running
+                os._exit(1)
+
+            self._stop_event.wait(self.check_interval)
+
+
+def _signal_handler(signum, frame):
+    """Handle interrupt signals gracefully."""
+    global _shutdown_requested
+    sig_name = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
+    print(f"\n\nReceived {sig_name}, shutting down gracefully...")
+    _shutdown_requested = True
+    sys.exit(1)
+
+
+def _setup_signal_handlers():
+    """Setup signal handlers for graceful shutdown."""
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+    # SIGKILL cannot be caught
+
+
+def _check_shutdown():
+    """Check if shutdown was requested and exit if so."""
+    global _shutdown_requested
+    if _shutdown_requested:
+        print("Shutdown requested, exiting...")
+        sys.exit(1)
 
 
 # Supported video extensions
@@ -255,15 +443,74 @@ def _add_normals_to_ply(ply_path):
     PlyData([el], text=False).write(ply_path)
 
 
+def _run_colmap_command(cmd, verbose=True):
+    """Run a COLMAP command with real-time output."""
+    if verbose:
+        print(f"   Running: {' '.join(cmd[:3])}...")
+        sys.stdout.flush()
+
+    try:
+        # Run with real-time output (no capture)
+        result = subprocess.run(
+            cmd,
+            timeout=3600  # 1 hour timeout
+        )
+
+        if result.returncode != 0:
+            print(f"\nCOLMAP Error (exit code {result.returncode})")
+            return False
+
+        return True
+    except subprocess.TimeoutExpired:
+        print("\nCOLMAP command timed out (1 hour limit)")
+        return False
+    except Exception as e:
+        print(f"\nError running COLMAP: {e}")
+        return False
+
+
+def _count_colmap_points(sparse_dir):
+    """Count points in COLMAP reconstruction by reading points3D.bin."""
+    points_bin = Path(sparse_dir) / "points3D.bin"
+    if not points_bin.exists():
+        return 0
+
+    try:
+        import struct
+        with open(points_bin, 'rb') as f:
+            num_points = struct.unpack('<Q', f.read(8))[0]
+        return num_points
+    except:
+        return 0
+
+
+def _count_colmap_images(sparse_dir):
+    """Count registered images in COLMAP reconstruction."""
+    images_bin = Path(sparse_dir) / "images.bin"
+    if not images_bin.exists():
+        return 0
+
+    try:
+        import struct
+        with open(images_bin, 'rb') as f:
+            num_images = struct.unpack('<Q', f.read(8))[0]
+        return num_images
+    except:
+        return 0
+
+
 def run_colmap_reconstruction(input_dir: str, output_dir: str,
                                camera_model: str = "SIMPLE_PINHOLE",
                                single_camera: bool = True,
                                verbose: bool = True,
                                resize_width: int = None,
                                resize_height: int = None,
-                               resize_max: int = None):
+                               resize_max: int = None,
+                               use_gpu: bool = True,
+                               gpu_index: int = 0,
+                               memory_monitor: MemoryMonitor = None):
     """
-    Run COLMAP reconstruction pipeline on input images.
+    Run COLMAP reconstruction pipeline using official COLMAP binary with CUDA support.
 
     Args:
         input_dir: Directory containing input images
@@ -274,6 +521,9 @@ def run_colmap_reconstruction(input_dir: str, output_dir: str,
         resize_width: Resize images to this width (maintains aspect ratio)
         resize_height: Resize images to this height (maintains aspect ratio)
         resize_max: Resize images so largest dimension equals this value
+        use_gpu: Whether to use GPU for SIFT extraction/matching (default: True)
+        gpu_index: GPU device index to use (default: 0)
+        memory_monitor: Optional MemoryMonitor instance for safeguards
     """
     input_path = Path(input_dir)
     output_path = Path(output_dir)
@@ -343,72 +593,145 @@ def run_colmap_reconstruction(input_dir: str, output_dir: str,
     if database_path.exists():
         database_path.unlink()
 
-    # Step 1: Feature extraction
+    # Determine camera mode for COLMAP
+    camera_mode = "SINGLE" if single_camera else "AUTO"
+
+    # GPU settings
+    sift_gpu = "1" if use_gpu else "0"
+    gpu_idx = str(gpu_index) if use_gpu else "-1"
+
+    # Step 1: Feature extraction using official COLMAP binary
     if verbose:
-        print("\n[1/3] Extracting features...")
+        print("\n[1/3] Extracting features (COLMAP CUDA)...")
+        if use_gpu:
+            print(f"   Using GPU {gpu_index} for SIFT extraction")
+        else:
+            print("   Using CPU for SIFT extraction")
 
-    extraction_options = pycolmap.FeatureExtractionOptions()
-    extraction_options.sift.max_num_features = 8192
+    # Check memory before starting
+    _check_shutdown()
+    is_critical, msg = _check_memory_thresholds(gpu_index=gpu_index)
+    if is_critical:
+        print(f"\n{msg}")
+        print("Aborting before feature extraction to prevent crash.")
+        sys.exit(1)
 
-    pycolmap.extract_features(
-        database_path=str(database_path),
-        image_path=str(images_dir),
-        camera_mode=pycolmap.CameraMode.SINGLE if single_camera else pycolmap.CameraMode.AUTO,
-        camera_model=camera_model,
-        extraction_options=extraction_options,
-    )
+    feature_cmd = [
+        "colmap", "feature_extractor",
+        "--database_path", str(database_path),
+        "--image_path", str(images_dir),
+        "--ImageReader.camera_model", camera_model,
+        "--ImageReader.single_camera", "1" if single_camera else "0",
+        "--FeatureExtraction.use_gpu", sift_gpu,
+        "--FeatureExtraction.gpu_index", gpu_idx,
+        "--SiftExtraction.max_num_features", "8192",
+    ]
+
+    if not _run_colmap_command(feature_cmd, verbose):
+        print("Error: Feature extraction failed")
+        sys.exit(1)
 
     if verbose:
         print("   Features extracted successfully")
 
-    # Step 2: Feature matching
+    # Step 2: Feature matching using official COLMAP binary
     if verbose:
-        print("\n[2/3] Matching features...")
+        print("\n[2/3] Matching features (COLMAP CUDA)...")
+        if use_gpu:
+            print(f"   Using GPU {gpu_index} for SIFT matching")
+        else:
+            print("   Using CPU for SIFT matching")
 
-    matching_options = pycolmap.FeatureMatchingOptions()
+    # Check memory before matching
+    _check_shutdown()
+    is_critical, msg = _check_memory_thresholds(gpu_index=gpu_index)
+    if is_critical:
+        print(f"\n{msg}")
+        print("Aborting before feature matching to prevent crash.")
+        sys.exit(1)
 
-    pycolmap.match_exhaustive(
-        database_path=str(database_path),
-        matching_options=matching_options,
-    )
+    match_cmd = [
+        "colmap", "exhaustive_matcher",
+        "--database_path", str(database_path),
+        "--FeatureMatching.use_gpu", sift_gpu,
+        "--FeatureMatching.gpu_index", gpu_idx,
+    ]
+
+    if not _run_colmap_command(match_cmd, verbose):
+        print("Error: Feature matching failed")
+        sys.exit(1)
 
     if verbose:
         print("   Features matched successfully")
 
-    # Step 3: Sparse reconstruction (mapping)
+    # Step 3: Sparse reconstruction (mapping) using official COLMAP binary
     if verbose:
-        print("\n[3/3] Running sparse reconstruction...")
+        print("\n[3/3] Running sparse reconstruction (COLMAP mapper)...")
 
-    maps = pycolmap.incremental_mapping(
-        database_path=str(database_path),
-        image_path=str(images_dir),
-        output_path=str(sparse_dir.parent),
-        options=pycolmap.IncrementalPipelineOptions(
-            min_num_matches=15,
-        )
-    )
-
-    if not maps:
-        print("Error: Reconstruction failed - no maps generated")
+    # Check memory before reconstruction
+    _check_shutdown()
+    is_critical, msg = _check_memory_thresholds(gpu_index=gpu_index)
+    if is_critical:
+        print(f"\n{msg}")
+        print("Aborting before sparse reconstruction to prevent crash.")
         sys.exit(1)
 
-    # Find the largest reconstruction
-    largest_map = max(maps.values(), key=lambda m: m.num_reg_images())
+    mapper_cmd = [
+        "colmap", "mapper",
+        "--database_path", str(database_path),
+        "--image_path", str(images_dir),
+        "--output_path", str(sparse_dir.parent),
+        "--Mapper.min_num_matches", "15",
+    ]
+
+    if not _run_colmap_command(mapper_cmd, verbose):
+        print("Error: Sparse reconstruction failed")
+        sys.exit(1)
+
+    # Find the best reconstruction (largest by number of images)
+    best_model = None
+    best_num_images = 0
+
+    for model_dir in (sparse_dir.parent).iterdir():
+        if model_dir.is_dir():
+            num_images = _count_colmap_images(model_dir)
+            if num_images > best_num_images:
+                best_num_images = num_images
+                best_model = model_dir
+
+    if best_model is None:
+        print("Error: Reconstruction failed - no models generated")
+        sys.exit(1)
+
+    # Move best model to sparse/0 if needed
+    if best_model.name != "0":
+        if sparse_dir.exists():
+            shutil.rmtree(sparse_dir)
+        shutil.move(str(best_model), str(sparse_dir))
+
+    num_points = _count_colmap_points(sparse_dir)
 
     if verbose:
         print(f"   Reconstruction complete!")
-        print(f"   Registered images: {largest_map.num_reg_images()}/{len(images)}")
-        print(f"   3D points: {largest_map.num_points3D()}")
+        print(f"   Registered images: {best_num_images}/{len(images)}")
+        print(f"   3D points: {num_points}")
 
-    # Save the reconstruction
-    largest_map.write(sparse_dir)
-
-    # Also export as PLY for visualization
+    # Export point cloud as PLY using COLMAP
     ply_path = sparse_dir / "points3D.ply"
-    largest_map.export_PLY(str(ply_path))
 
-    # Add normals to PLY (required by 3DGS)
-    _add_normals_to_ply(ply_path)
+    ply_cmd = [
+        "colmap", "model_converter",
+        "--input_path", str(sparse_dir),
+        "--output_path", str(ply_path),
+        "--output_type", "PLY",
+    ]
+
+    if not _run_colmap_command(ply_cmd, verbose):
+        print("Warning: Could not export PLY file")
+    else:
+        # Add normals to PLY (required by 3DGS)
+        if ply_path.exists():
+            _add_normals_to_ply(ply_path)
 
     # Create symlink: renders -> images (for compatibility)
     renders_link = output_path / "renders"
@@ -418,7 +741,8 @@ def run_colmap_reconstruction(input_dir: str, output_dir: str,
 
     if verbose:
         print(f"\n   Saved reconstruction to {sparse_dir}")
-        print(f"   Exported point cloud to {ply_path} (with normals)")
+        if ply_path.exists():
+            print(f"   Exported point cloud to {ply_path} (with normals)")
 
     # Cleanup - remove other reconstructions if any
     for item in (sparse_dir.parent).iterdir():
@@ -427,8 +751,8 @@ def run_colmap_reconstruction(input_dir: str, output_dir: str,
 
     return {
         "num_images": len(images),
-        "num_registered": largest_map.num_reg_images(),
-        "num_points": largest_map.num_points3D(),
+        "num_registered": best_num_images,
+        "num_points": num_points,
         "output_dir": str(output_path),
     }
 
@@ -483,8 +807,47 @@ def main():
         "--quiet", "-q", action="store_true",
         help="Suppress progress messages"
     )
+    # GPU options
+    parser.add_argument(
+        "--gpu_index", type=int, default=0,
+        help="GPU device index to use for SIFT extraction/matching (default: 0)"
+    )
+    parser.add_argument(
+        "--no_gpu", action="store_true",
+        help="Disable GPU, use CPU for SIFT extraction/matching"
+    )
+    # Memory safeguard options
+    parser.add_argument(
+        "--ram_threshold", type=int, default=90,
+        help="RAM usage percentage threshold to abort (default: 90)"
+    )
+    parser.add_argument(
+        "--gpu_mem_threshold", type=int, default=95,
+        help="GPU memory usage percentage threshold to abort (default: 95)"
+    )
+    parser.add_argument(
+        "--no_memory_monitor", action="store_true",
+        help="Disable background memory monitoring"
+    )
 
     args = parser.parse_args()
+
+    # Set up signal handlers for graceful shutdown
+    _setup_signal_handlers()
+
+    # Determine GPU usage
+    use_gpu = not args.no_gpu
+    gpu_index = args.gpu_index
+
+    # Start memory monitor
+    memory_monitor = None
+    if not args.no_memory_monitor:
+        memory_monitor = MemoryMonitor(
+            ram_threshold=args.ram_threshold,
+            gpu_threshold=args.gpu_mem_threshold,
+            gpu_index=gpu_index,
+            check_interval=2.0
+        )
 
     # Detect if input is video or image directory
     is_video = _is_video_file(args.input)
@@ -495,6 +858,16 @@ def main():
     print(f"Input:  {args.input} ({'video' if is_video else 'images'})")
     print(f"Output: {args.output}")
     print(f"Camera: {args.camera_model} ({'multi' if args.multi_camera else 'single'})")
+
+    # Show GPU info
+    if use_gpu:
+        print(f"GPU:    device {gpu_index} (SIFT extraction/matching)")
+        gpu_info = _get_gpu_memory_info()
+        if gpu_info and gpu_index < len(gpu_info):
+            gpu = gpu_info[gpu_index]
+            print(f"        {gpu['total_mb']} MB total, {gpu['free_mb']} MB free")
+    else:
+        print("GPU:    disabled (CPU mode)")
 
     # Show resize info
     if args.resize_width:
@@ -516,8 +889,6 @@ def main():
             print(f"Video:  extract at ~2 FPS (default)")
         if args.max_frames:
             print(f"        max {args.max_frames} frames")
-
-    print("=" * 60)
 
     # If video, extract frames first
     video_result = None
@@ -549,16 +920,35 @@ def main():
         resize_height = args.resize_height
         resize_max = args.resize_max
 
-    result = run_colmap_reconstruction(
-        input_dir=input_dir,
-        output_dir=args.output,
-        camera_model=args.camera_model,
-        single_camera=not args.multi_camera,
-        verbose=not args.quiet,
-        resize_width=resize_width,
-        resize_height=resize_height,
-        resize_max=resize_max
-    )
+    # Check initial memory status
+    mem_info = _get_memory_info()
+    if mem_info:
+        print(f"RAM:    {mem_info['available_gb']:.1f} GB available ({100 - mem_info['percent_used']:.0f}%)")
+
+    print("=" * 60)
+
+    # Start memory monitor before COLMAP processing
+    if memory_monitor:
+        memory_monitor.start()
+
+    try:
+        result = run_colmap_reconstruction(
+            input_dir=input_dir,
+            output_dir=args.output,
+            camera_model=args.camera_model,
+            single_camera=not args.multi_camera,
+            verbose=not args.quiet,
+            resize_width=resize_width,
+            resize_height=resize_height,
+            resize_max=resize_max,
+            use_gpu=use_gpu,
+            gpu_index=gpu_index,
+            memory_monitor=memory_monitor
+        )
+    finally:
+        # Stop memory monitor
+        if memory_monitor:
+            memory_monitor.stop()
 
     # Cleanup temporary frames if video input
     if is_video:
